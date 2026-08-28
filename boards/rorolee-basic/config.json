@@ -1,0 +1,5 @@
+{
+    "manufacturer": "deotaland",
+    "type": "rorolee-basic",
+    "target": "esp32s3"
+}
