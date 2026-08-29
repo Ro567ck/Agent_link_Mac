@@ -280,6 +280,14 @@ void SendManifest(bool force) {
     do {
         size_t n = total - off;
         if (n > budget) n = budget;
+        // Never cut a UTF-8 sequence in half. The App is supposed to concatenate the raw bytes and parse
+        // once at last=1, in which case where the cut falls cannot matter — but an App that decodes each
+        // chunk to a string before appending (the ordinary way to handle a BLE notify) turns a split
+        // multi-byte character into a replacement char, and the whole manifest then fails to parse:
+        // every endpoint disappears at once, including ones whose description never changed. The
+        // descriptions carry Chinese, so this is not hypothetical, and it costs at most 3 bytes a chunk.
+        // Continuation bytes are 10xxxxxx; walk back off the boundary while the NEXT byte is one.
+        while (n > 1 && off + n < total && (jb[off + n] & 0xC0) == 0x80) --n;
         std::vector<uint8_t> p;
         p.reserve(2 + n);
         p.push_back(idx);

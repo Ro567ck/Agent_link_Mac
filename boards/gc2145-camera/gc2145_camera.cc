@@ -17,6 +17,22 @@
 // the App transcribes and forwards it to the Agent. GPIO3 is not shared with any other peripheral, so
 // the key is simply polled by level.
 //
+// The cat is not quite static: while a study phase is running its whiskers wag, and they stop the moment
+// the phase does. That is the only always-visible sign that the device is actually watching — the LED
+// says the same thing, but a moving cat reads as "live" from across the room without decoding a colour.
+//
+// A distracted verdict is answered by the Agent SPEAKING STUDY_ALERT_PHRASE — that voice is the
+// reminder. The device also carries the same line as PCM in flash (alert_voice.pcm) and speaks it on a
+// timer: the first TTS chunk that reaches the DAC cancels it, so the local copy is only ever heard when
+// the cloud failed to deliver. The device is therefore never mute about a distracted verdict, whatever
+// the App does — which matters, because for a while the App was the only thing saying anything at all.
+//
+// Phase changes chime through that same speaker: two rising notes when a pomodoro starts, two falling
+// ones when it ends, three rising when the whole session completes. The tones are synthesised into the
+// play buffer instead of driving a buzzer, because this board has only two free GPIOs left. They are
+// written to the buffer directly rather than through PlayAudio(), so the study-phase speaker gate below
+// never swallows them — a phase change is exactly what the user must not miss.
+//
 // The study feature exposes five MCP endpoints — the SDK serializes every registered endpoint into the
 // manifest it pushes on connect, and the cloud derives MCP tools/resources from it:
 //   "study_session" (out) Agent-callable: start a session with the plan it worked out, as JSON
@@ -31,7 +47,7 @@
 //   "study_status"  (in)  phase changes reported by the device (study_started, break_started,
 //                         session_completed, ...) with cycle progress.
 //   "camera0"       (out) Agent-callable: take a snapshot now — only during an active study phase.
-//   "study_watch"   (in)  mirrors CAMERA_ANALYSIS_PROMPT after each photo the device sends on its own.
+//   "study_watch"   (in)  which snapshot is currently awaiting a verdict, refreshed after each photo.
 //
 // The device owns the clock, not the Agent: once a plan is accepted, phase transitions happen locally, so
 // the schedule survives a busy or briefly disconnected Agent. The Agent is told about each transition
@@ -40,18 +56,28 @@
 // Camera permission is tied to the session: photos are taken ONLY during a POMODORO_STUDYING phase.
 // Idle, paused, and every break gate the camera off — including the Agent's own "camera0" calls.
 //
-// The speaker is gated the same way, in PlayAudio: while a study phase is running the DAC is muted unless
-// a false verdict has just armed an alert window. That makes "silent when the user is studying properly"
-// a device-side guarantee instead of a request the Agent has to honour — a chatty reply to a per-minute
-// photo would otherwise interrupt exactly the focus this is supposed to protect. Outside study phases
-// audio is untouched, so normal conversation still works.
+// The speaker is gated the same way, in PlayAudio: while a study phase is running the DAC is muted, so
+// "silent when the user is studying properly" is a device-side guarantee rather than a request the Agent
+// has to honour — a chatty reply to a per-minute photo would otherwise interrupt exactly the focus this
+// is supposed to protect. Outside study phases audio is untouched, so conversation still works.
+//
+// The gate opens on the QUESTION, not the answer. Every device-initiated prompt arms an answer window
+// (STUDY_ANSWER_WINDOW_MS); an `attentive` verdict closes it immediately, a `distracted` one extends it.
+// Gating on the verdict instead — waiting for "distracted" before unmuting — could not work: the reply's
+// audio arrives over L2CAP while the verdict arrives over the GATT control channel, two independent
+// channels the device cannot order, and the Agent's spoken text is usually produced before its
+// bookkeeping tool call. Whenever the TTS won that race it was discarded, and the alert the whole
+// feature exists for was silently lost. Arming on the question removes the race; closing on `attentive`
+// keeps the silence.
 //
 // What actually makes the Agent answer is the 0x04 Prompt event (agent_link_push_prompt): the App
 // forwards that text verbatim to the Agent as if the user had typed it. A 0x19 IoReading is only a data
-// update — the App caches it and nothing starts a turn — so the reading alone leaves the photo sitting
-// in the chat unanswered. Every device-initiated snapshot therefore sends BOTH: the reading for MCP
-// semantics, and the prompt as the trigger. The prompt is deferred by CAMERA_ANALYSIS_PROMPT_DELAY_MS
-// so the image (async, streamed over L2CAP) is there before the Agent is asked about it.
+// update — the App caches it and nothing starts a turn — so the reading alone would leave the photo
+// sitting in the chat unanswered. Each snapshot therefore sends both, but they must not say the same
+// thing: the prompt carries the instruction, the reading carries which snapshot it refers to. Echoing
+// the instruction into the reading (as this once did) hands the model the same order twice, and it read
+// as two separate requests. The prompt is deferred by CAMERA_ANALYSIS_PROMPT_DELAY_MS so the image
+// (async, streamed over L2CAP) is there before the Agent is asked about it.
 
 #include "board.h"
 #include "config.h"
@@ -118,6 +144,13 @@ static const char* PhaseToString(PomodoroPhase p) {
     }
 }
 
+// One whisker wag cycle, as Q7 fractions of CAT_WHISKER_WAG_PX. Shaped like a sine rather than a
+// triangle so the tips ease at the extremes instead of snapping between them. One step per capture-loop
+// tick (100ms) -> ~1.6s per full cycle, which reads as a calm twitch rather than a nervous one.
+static const int8_t kWagCycle[] = {   0,   49,   90,  118,  127,  118,   90,   49,
+                                      0,  -49,  -90, -118, -127, -118,  -90,  -49 };
+static constexpr uint8_t kWagSteps = sizeof(kWagCycle) / sizeof(kWagCycle[0]);
+
 class Gc2145CameraBoard : public Board {
 public:
     Gc2145CameraBoard() {
@@ -171,28 +204,30 @@ public:
     // to the DAC. If the buffer is full (link burst > realtime), drop and warn.
     void PlayAudio(const uint8_t* pcm16, size_t bytes) override {
         if (!play_buf_ || !pcm16 || bytes == 0) return;
-        // Speaker gate. During a study phase the device is meant to be silent unless the Agent has just
-        // reported a distracted verdict — otherwise every per-minute analysis reply would talk over the
-        // user. Enforced here rather than trusting the Agent to stay quiet: the guarantee is "no audio
-        // while studying attentively", so it has to hold even if the Agent narrates anyway.
+        // Speaker gate. During a study phase the device stays silent unless something the device itself
+        // did opened a window: it asked the Agent a question, or the user pressed PTT. Enforced here
+        // rather than trusting the Agent to stay quiet, so "no audio while studying attentively" holds
+        // even if the Agent narrates anyway.
         // Outside a study phase (idle / break / paused) audio plays normally — ordinary conversation.
         if (!SpeakerAllowed()) {
-            if (!muted_notice_) { muted_notice_ = true; ESP_LOGI(TAG, "TTS muted — studying, no alert pending"); }
+            if (!muted_notice_) { muted_notice_ = true; ESP_LOGI(TAG, "TTS muted — studying, no answer window open"); }
             return;
         }
         muted_notice_ = false;
+        // The Agent is speaking, so the local fallback chime is not needed — the voice is the reminder.
+        chime_due_tick_.store(0, std::memory_order_release);
         if (++play_chunks_ == 1) ESP_LOGI(TAG, "first TTS chunk arrived (%uB) — L2CAP downlink OK", (unsigned)bytes);
         const size_t sent = xStreamBufferSend(play_buf_, pcm16, bytes, 0);  // timeout 0 = non-blocking
         if (sent < bytes)
             ESP_LOGW(TAG, "play buffer full — dropped %u/%u bytes", (unsigned)(bytes - sent), (unsigned)bytes);
     }
     // End of a TTS segment: PlayLoop keeps playing whatever is left in the buffer (not flushed).
-    // Close the alert window here — one verdict buys one spoken alert, not a window of free speech.
     void AudioEnd() override {
         ESP_LOGI(TAG, "AudioEnd (TTS segment done, %u chunk(s) played)", (unsigned)play_chunks_);
-        // One request buys one spoken reply, not an open window afterwards.
+        // One question buys one spoken answer, not an open window afterwards. Only close on a segment
+        // that actually played: a muted one must not consume the window a later answer still needs.
         if (play_chunks_ > 0) {
-            alert_until_tick_.store(0, std::memory_order_release);
+            answer_until_tick_.store(0, std::memory_order_release);
             reply_until_tick_.store(0, std::memory_order_release);
         }
         play_chunks_ = 0;
@@ -332,8 +367,12 @@ private:
         session_desc.dir          = AGENT_IO_OUT;
         session_desc.kind         = "study.pomodoro_session";
         session_desc.value        = AGENT_VAL_STR;
-        session_desc.desc         = "Start Pomodoro session. JSON: {total_cycles:u8, study_mins:u16, "
-                                    "short_break_mins:u16, long_break_mins:u16}. Device manages timer locally.";
+        session_desc.desc         = "Start a Pomodoro session. JSON: {total_cycles:u8, study_mins:u16, "
+                                    "short_break_mins:u16, long_break_mins:u16}. The DEVICE owns the "
+                                    "timer and announces each phase change itself. Those '[设备状态播报]' "
+                                    "messages are notifications, NOT user requests — never call this "
+                                    "endpoint in response to one. Ignored while a session is already "
+                                    "running; call study_control 'stop' first to change the plan.";
         session_desc.display_name = "Start Study Session";
         agent_link_register_io(&session_desc, &Gc2145CameraBoard::OnStartSession, this);
 
@@ -352,9 +391,15 @@ private:
         verdict_desc.id           = "study_verdict";
         verdict_desc.dir          = AGENT_IO_OUT;
         verdict_desc.kind         = "study.attention_verdict";
-        verdict_desc.value        = AGENT_VAL_BOOL;
-        verdict_desc.desc         = "Photo analysis verdict. true=focused (say nothing), false=distracted (say '"
-                                    STUDY_ALERT_PHRASE "' aloud). Call for EVERY photo.";
+        // A word, not a boolean: 'true' carried no hint of which way round it was, and it came back
+        // inverted on every photo — see ParseVerdict. Spelling the outcome out removes the polarity.
+        verdict_desc.value        = AGENT_VAL_STR;
+        // Kept deliberately short. The first version of this spelled the rules out over four lines and
+        // pushed the whole manifest from 1773B to 1939B — every endpoint's chunk boundaries moved with
+        // it, and the App started failing calls to endpoints that had not changed at all. The manifest
+        // is a shared budget: a description is not free just because it is only one endpoint's.
+        verdict_desc.desc         = "Verdict for the newest photo, one word: 'focused' (silent) or "
+                                    "'distracted' (device alerts). Not true/false. Call for EVERY photo.";
         verdict_desc.display_name = "Attention Verdict";
         agent_link_register_io(&verdict_desc, &Gc2145CameraBoard::OnVerdict, this);
 
@@ -394,11 +439,25 @@ private:
         }
         {
             std::lock_guard<std::mutex> lk(self->pomo_mtx_);
+            // A running session is never restarted from here, and that is a loop-breaker, not a nicety.
+            // Every phase change is announced to the Agent as a 0x04 Prompt, which the App forwards
+            // "verbatim, as if the user had typed it". A model reading "开始专注学习" sees an imperative
+            // from the user and does the obvious thing: it calls this endpoint. That restarted the phase,
+            // which announced again, which called again. The five identical announcements were that loop
+            // — not a resend; the whole send path is single-shot with no retry.
+            // Changing the plan mid-session goes through study_control "stop" first.
+            if (self->pomo_.phase != POMODORO_IDLE) {
+                ESP_LOGW(TAG, "study_session ignored — session already running (phase=%s); stop it first",
+                         PhaseToString(self->pomo_.phase));
+                return;
+            }
             memcpy(self->pending_json_, args, len);
             self->pending_json_[len] = '\0';
         }
         self->pending_cmd_.store(kPendStart, std::memory_order_release);
-        ESP_LOGI(TAG, "study_session queued (%uB plan)", (unsigned)len);
+        // The bytes, not just their count: a 4B "plan" is the App's placeholder, not a schedule, and
+        // logging only the length hid that for an entire session's worth of snapshots.
+        ESP_LOGI(TAG, "study_session queued (%uB plan): %.*s", (unsigned)len, (int)(len < 96 ? len : 96), (const char*)args);
     }
 
     // Parse the Agent's plan: {"total_cycles":4,"study_mins":25,"short_break_mins":5,"long_break_mins":15}.
@@ -412,6 +471,17 @@ private:
         }
         cJSON* root = cJSON_Parse(json);
         if (!root) { ESP_LOGE(TAG, "study_session: bad JSON, not started: %s", json); return false; }
+
+        // `true`, `1` and `"start"` are all valid JSON, so cJSON_Parse accepts them and the field lookups
+        // below then quietly return every default — which is how a session once started as "4 x 25min,
+        // 5min, 15min, every 4" without the Agent having chosen a single one of those numbers. The plan
+        // still falls back (a session the user asked for should start), but it says so, loudly, because
+        // a placeholder arriving where a schedule belongs means the Agent's plan is being dropped in
+        // transit and no amount of prompting will fix it.
+        if (!cJSON_IsObject(root)) {
+            ESP_LOGW(TAG, "study_session: payload '%s' is not a plan object — the Agent's schedule did not "
+                          "arrive; starting on device defaults", json);
+        }
 
         {
             std::lock_guard<std::mutex> lk(pomo_mtx_);
@@ -437,28 +507,106 @@ private:
         return len == n && memcmp(args, want, n) == 0;
     }
 
-    // 0x33 IoActuate for "study_verdict". args[0]: 1 = attentive, 0 = distracted.
-    // Attentive is the quiet path — nothing happens at all, which is the whole point.
-    // Distracted opens the speaker gate for STUDY_ALERT_WINDOW_MS so the Agent's "请认真学习" is audible,
-    // and flashes the LED red. Runs on the host task, so it only sets state (no sends, no blocking).
+    enum class Verdict : uint8_t { kAttentive, kDistracted, kUnparsed };
+
+    // The SDK hands 0x33 args through exactly as the App sent them — it does not decode by declared
+    // value type (see the 0x33 branch in agent_link.cpp).
+    //
+    // This endpoint used to be declared BOOL, and that is what broke the whole feature: the Agent wrote
+    // "请认真学习" in the chat and then called study_verdict with a 1-byte `true` on every single photo,
+    // five for five. `true` is the attentive branch, which slams the answer window shut — so the alert
+    // audio the App really did stream down arrived at a speaker that had just been muted, and the only
+    // surviving trace was `AudioEnd (0 chunk(s) played)`. Whether the polarity was inverted by the model
+    // or the value was collapsed to 1 in transit could not be told apart from a single byte, and it does
+    // not matter: a bare boolean has no way to be self-evidently wrong. The endpoint now takes the words
+    // 'focused' / 'distracted', which carry their meaning in the payload and cannot be silently flipped.
+    //
+    // The old encodings are still accepted so an App or model that has not caught up keeps working, and
+    // anything else is refused rather than guessed — a wrong "attentive" is invisible, and invisible is
+    // exactly what made this take five snapshots and a serial capture to find.
+    static Verdict ParseVerdict(const uint8_t* args, size_t len) {
+        if (len == 0) return Verdict::kUnparsed;
+        if (len == 1 && args[0] <= 1) return args[0] ? Verdict::kAttentive : Verdict::kDistracted;
+
+        // Lower-case, and drop the quotes/whitespace a JSON-ish serialiser may leave around the word.
+        char t[16];
+        size_t b = 0, e = len;
+        while (b < e && (args[b] == ' ' || args[b] == '"' || args[b] == '\'')) ++b;
+        while (e > b && (args[e-1] == ' ' || args[e-1] == '"' || args[e-1] == '\'' || args[e-1] == '\n' ||
+                         args[e-1] == '\r' || args[e-1] == '\0')) --e;
+        const size_t n = (e - b < sizeof(t) - 1) ? (e - b) : sizeof(t) - 1;
+        for (size_t i = 0; i < n; ++i) {
+            const uint8_t c = args[b + i];
+            t[i] = static_cast<char>((c >= 'A' && c <= 'Z') ? c + 32 : c);
+        }
+        t[n] = '\0';
+
+        // Only the word is trusted for `focused`, and the asymmetry is deliberate.
+        //
+        // The App does not forward the model's argument: it sends a fixed truthy value coerced to the
+        // endpoint's declared type — 1 byte 0x01 while this was BOOL, the 4 bytes "true" now that it is
+        // STR. study_session proves the same thing independently: it receives 4B where a plan object
+        // should be, and every field falls back to its default. So a truthy payload here carries no
+        // information at all — it is indistinguishable from the placeholder, and reading it as
+        // "focused" is what silently muted the alert five times out of five.
+        //
+        // A false-ish payload has the opposite risk profile: the placeholder is never false, so it can
+        // only come from something that meant it, and being wrong costs one spurious reminder — audible,
+        // obvious, harmless. That one stays accepted. Truthy legacy encodings become undecodable, which
+        // leaves the speaker gate open and dumps the bytes, i.e. fails loudly instead of silently.
+        if (!strcmp(t, "focused"))
+            return Verdict::kAttentive;
+        if (!strcmp(t, "distracted") || !strcmp(t, "0") || !strcmp(t, "false") || !strcmp(t, "no")  || !strcmp(t, "off"))
+            return Verdict::kDistracted;
+        return Verdict::kUnparsed;
+    }
+
+    // 0x33 IoActuate for "study_verdict". Runs on the host task, so it only sets state — no sends, no
+    // blocking, and the chime is handed to the capture task rather than synthesised here.
     static void OnVerdict(const char* /*id*/, const uint8_t* args, size_t len, void* ctx) {
         auto* self = static_cast<Gc2145CameraBoard*>(ctx);
-        if (!self || !args || len < 1) return;
-        const bool attentive = (args[0] != 0);
+        if (!self || !args) return;
 
-        if (attentive) {
-            // No alert, no sound. The only thing that happens is clearing a red left by an earlier
-            // verdict — the LED tracks current state, so leaving it red would be stale, not silent.
+        // Always log what actually arrived, not just what it was decoded as. The whole boolean fiasco
+        // was invisible because the only record was "actuate 'study_verdict' (1B args)" — a length with
+        // no content — while the decoded result read as a perfectly ordinary "attentive".
+        ESP_LOGI(TAG, "study_verdict payload: %uB '%.*s'", (unsigned)len, (int)(len < 24 ? len : 24), (const char*)args);
+
+        switch (ParseVerdict(args, len)) {
+        case Verdict::kAttentive:
+            // The quiet path. Shut the answer window so whatever the Agent is about to say is muted,
+            // and clear a red left by an earlier verdict — the LED tracks current state, so leaving it
+            // red would be stale rather than silent.
+            self->answer_until_tick_.store(0, std::memory_order_release);
             if (self->led_red_.exchange(false, std::memory_order_acq_rel)) (void)self->led_.SetColor(0, 32, 0);
-            ESP_LOGI(TAG, "verdict: attentive — no device reaction");
+            ESP_LOGI(TAG, "verdict: attentive — speaker re-muted, no reaction");
+            return;
+
+        case Verdict::kDistracted:
+            // Extend the window from now, in case the Agent took longer to answer than the question's
+            // own window allowed, and arm the fallback deadline. The first TTS chunk that reaches the
+            // DAC disarms it, so the chime only ever fires when the spoken alert did not turn up.
+            self->answer_until_tick_.store(xTaskGetTickCount() + pdMS_TO_TICKS(STUDY_ALERT_WINDOW_MS),
+                                           std::memory_order_release);
+            self->chime_due_tick_.store(xTaskGetTickCount() + pdMS_TO_TICKS(STUDY_ALERT_FALLBACK_MS),
+                                        std::memory_order_release);
+            self->led_red_.store(true, std::memory_order_release);
+            (void)self->led_.SetColor(48, 0, 0);           // red = not studying
+            ESP_LOGW(TAG, "verdict: DISTRACTED — speaker open %ums for the alert voice (local chime in %ums if it never comes)",
+                     (unsigned)STUDY_ALERT_WINDOW_MS, (unsigned)STUDY_ALERT_FALLBACK_MS);
+            return;
+
+        case Verdict::kUnparsed:
+        default:
+            // Leave every window exactly as it is: the answer this verdict belongs to is still allowed
+            // through, and we have not faked a judgement in either direction. The payload is dumped
+            // because the only thing worse than an undecodable verdict is one that cannot be diagnosed
+            // from the log — that is what cost us the boolean bug above.
+            ESP_LOGE(TAG, "verdict: cannot decode %uB payload (want 'focused' / 'distracted') — ignored",
+                     (unsigned)len);
+            ESP_LOG_BUFFER_HEXDUMP(TAG, args, (len < 32) ? len : 32, ESP_LOG_ERROR);
             return;
         }
-        // Distracted: unmute the speaker for the alert, and go red until the next verdict.
-        self->alert_until_tick_.store(xTaskGetTickCount() + pdMS_TO_TICKS(STUDY_ALERT_WINDOW_MS),
-                                     std::memory_order_release);
-        self->led_red_.store(true, std::memory_order_release);
-        (void)self->led_.SetColor(48, 0, 0);           // red = not studying
-        ESP_LOGW(TAG, "verdict: DISTRACTED — speaker unmuted %ums for the alert", (unsigned)STUDY_ALERT_WINDOW_MS);
     }
 
     // Host task: classify and stash only (see OnStartSession).
@@ -481,7 +629,11 @@ private:
         desc.dir          = AGENT_IO_OUT;
         desc.kind         = "camera.capture";
         desc.value        = AGENT_VAL_BOOL;
-        desc.desc         = "Capture image. Only during active study phase. " CAMERA_ANALYSIS_PROMPT;
+        // Describes the shutter, nothing else. This used to append CAMERA_ANALYSIS_PROMPT, which put the
+        // "analyse the photo and call study_verdict" instruction into the manifest as part of what this
+        // tool DOES — a third copy of the same order, permanently in the model's context, attached to
+        // the one endpoint that merely takes the picture.
+        desc.desc         = "Take one photo now and upload it. Only works during an active study phase.";
         desc.display_name = "Camera Snapshot";
         agent_link_register_io(&desc, &Gc2145CameraBoard::OnCaptureCmd, this);
     }
@@ -506,7 +658,7 @@ private:
         ESP_LOGI(TAG, "WS2812 LED ready on GPIO%d (App endpoint: led0)", (int)WS2812_LED_PIN);
     }
 
-    // ── ES8311 mic codec (input only; the speaker side is unused on this board) ──
+    // ── ES8311 codec, full duplex: mic for push-to-talk, DAC for TTS and the Pomodoro chime ──
     void InitCodec() {
         Es8311Config c = {};
         c.i2c_port    = I2C_NUM_0;
@@ -548,6 +700,89 @@ private:
                 }
             }
         }
+    }
+
+    // ── Pomodoro chime ──
+    // Straight into play_buf_, NOT through PlayAudio(): a phase change is device-initiated feedback the
+    // user has to hear, so it must bypass the study-phase mute gate. Writing to the buffer also keeps
+    // PlayLoop the only task touching the codec, so a chime that lands mid-TTS queues behind it instead
+    // of interleaving into garbage.
+
+    // One square-wave note (freq_hz == 0 -> silence). The short fade in/out is not cosmetic: starting or
+    // stopping a waveform at full amplitude puts a step into the DAC, which a small speaker reproduces as
+    // a click louder than the note itself.
+    void Tone(uint32_t freq_hz, uint32_t ms) {
+        if (!play_buf_ || ms == 0) return;
+        constexpr uint32_t sr = AUDIO_SAMPLE_RATE;
+        const uint32_t total  = sr * ms / 1000u;
+        const uint32_t fade   = (sr / 200u) ? (sr / 200u) : 1u;          // 5ms
+        const uint32_t inc    = static_cast<uint32_t>((static_cast<uint64_t>(freq_hz) << 16) / sr);
+        uint32_t phase = 0;                                              // Q16, wraps on its own
+        int16_t chunk[128];
+        for (uint32_t done = 0; done < total; ) {
+            const uint32_t n = (total - done < 128u) ? (total - done) : 128u;
+            for (uint32_t i = 0; i < n; ++i) {
+                int32_t v = 0;
+                if (freq_hz) {
+                    v = (phase & 0x8000u) ? BEEP_AMPLITUDE : -BEEP_AMPLITUDE;
+                    phase += inc;
+                    const uint32_t idx = done + i;
+                    uint32_t g = 256;                                    // Q8 envelope
+                    if (idx < fade)              g = 256u * idx / fade;
+                    else if (total - idx < fade) g = 256u * (total - idx) / fade;
+                    v = v * static_cast<int32_t>(g) / 256;
+                }
+                chunk[i] = static_cast<int16_t>(v);
+            }
+            // The buffer holds ~0.5s, so this only waits when TTS is mid-stream. Bail rather than block
+            // the pomodoro task indefinitely — a missed chime must not stall the phase clock.
+            const size_t want = n * sizeof(int16_t);
+            if (xStreamBufferSend(play_buf_, chunk, want, pdMS_TO_TICKS(200)) < want) {
+                ESP_LOGW(TAG, "chime truncated — play buffer stayed full");
+                return;
+            }
+            done += n;
+        }
+    }
+
+    // The spoken alert, from flash. This used to be three high beeps, which said "something is wrong"
+    // without saying what — and it only ever plays when the cloud has already failed to deliver the
+    // line, so the device has to carry the words itself rather than gesture at them.
+    //
+    // Same route as the chimes: straight into play_buf_, bypassing the study-phase mute gate, with
+    // PlayLoop still the only task touching the codec. ~1.3s of PCM through a ~0.5s buffer means this
+    // blocks the caller for roughly a second; that is the capture task, whose only other job in that
+    // window is animating whiskers, and an alert that gets spoken is worth a stalled whisker.
+    void PlayAlertVoice() {
+        extern const uint8_t alert_pcm_start[] asm("_binary_alert_voice_pcm_start");
+        extern const uint8_t alert_pcm_end[]   asm("_binary_alert_voice_pcm_end");
+        if (!play_buf_) return;
+        const size_t total = static_cast<size_t>(alert_pcm_end - alert_pcm_start);
+        ESP_LOGI(TAG, "speaking the local alert ('%s', %uB PCM from flash)", STUDY_ALERT_PHRASE, (unsigned)total);
+        for (size_t off = 0; off < total; ) {
+            const size_t want = ((total - off) < 1024u) ? (total - off) : 1024u;
+            // Bail rather than block the capture task indefinitely, exactly as Tone() does: a truncated
+            // alert is bad, a wedged snapshot clock is worse.
+            if (xStreamBufferSend(play_buf_, alert_pcm_start + off, want, pdMS_TO_TICKS(300)) < want) {
+                ESP_LOGW(TAG, "local alert truncated at %u/%uB — play buffer stayed full", (unsigned)off, (unsigned)total);
+                return;
+            }
+            off += want;
+        }
+    }
+
+    // Direction carries the meaning, so the three are distinguishable without being read as words:
+    // rising = starting, falling = stopping, three rising = done for the day.
+    void ChimeStudyStart() {
+        Tone(BEEP_LOW_HZ, BEEP_TONE_MS);  Tone(0, BEEP_GAP_MS);  Tone(BEEP_HIGH_HZ, BEEP_TONE_MS);
+    }
+    void ChimeStudyEnd() {
+        Tone(BEEP_HIGH_HZ, BEEP_TONE_MS); Tone(0, BEEP_GAP_MS);  Tone(BEEP_LOW_HZ, BEEP_TONE_MS);
+    }
+    void ChimeSessionDone() {
+        Tone(BEEP_LOW_HZ, BEEP_TONE_MS);  Tone(0, BEEP_GAP_MS);
+        Tone(BEEP_MID_HZ, BEEP_TONE_MS);  Tone(0, BEEP_GAP_MS);
+        Tone(BEEP_HIGH_HZ, BEEP_TONE_MS * 2);
     }
 
     // ── Push-to-talk key (the board's one button) ──
@@ -621,17 +856,24 @@ private:
     //   0x04 Prompt (push_prompt)       — the trigger. The App forwards this verbatim to the Agent, so
     //                                     this is the one that actually produces an answer.
     // Both strings go out without their NUL — the frame's payload_len delimits them.
-    static void RequestAnalysis() {
+    void RequestAnalysis() {
         const char* prompt = CAMERA_ANALYSIS_PROMPT;
         const size_t len   = strlen(prompt);
 
-        const esp_err_t rr = agent_link_push_reading(kAnalysisIoId, prompt, len);
-        ESP_LOGI(TAG, "analysis reading -> %s (%uB, push=%s)", kAnalysisIoId, (unsigned)len, esp_err_to_name(rr));
+        // Data, not a restatement of the instruction below. This endpoint's job is to say WHICH photo is
+        // outstanding; the prompt says what to do about it. Putting the instruction in both meant the
+        // model received the same order down two channels and treated them as two requests.
+        // Phrased for a human: the App surfaces this value in the UI, so it has to read as a status line
+        // rather than a key=value pair, while still carrying the snapshot number.
+        char v[64];
+        const int vn = snprintf(v, sizeof v, "第%u张照片，等待判定", (unsigned)snapshot_seq_);
+        const esp_err_t rr = (vn > 0) ? agent_link_push_reading(kAnalysisIoId, v, (size_t)vn) : ESP_FAIL;
+        ESP_LOGI(TAG, "analysis reading -> %s ('%s', push=%s)", kAnalysisIoId, v, esp_err_to_name(rr));
 
         // INVALID_SIZE here = the prompt is longer than one BLE notify (see CAMERA_ANALYSIS_PROMPT):
         // shorten it, or the Agent never gets asked. Logged as an error because it silently breaks the feature.
         const esp_err_t rp = agent_link_push_prompt(prompt);
-        if (rp == ESP_OK) ESP_LOGI(TAG, "analysis prompt -> Agent (%uB, 0x04)", (unsigned)len);
+        if (rp == ESP_OK) { ArmAnswerWindow(); ESP_LOGI(TAG, "analysis prompt -> Agent (%uB, 0x04)", (unsigned)len); }
         else ESP_LOGE(TAG, "analysis prompt NOT sent (%uB): %s — Agent will not answer this photo",
                       (unsigned)len, esp_err_to_name(rp));
     }
@@ -682,7 +924,8 @@ private:
     // Drop any armed alert + the red LED. Called on every phase transition so a verdict that lands late
     // (or was never followed by TTS) cannot unmute the next phase.
     void ClearAlert() {
-        alert_until_tick_.store(0, std::memory_order_release);
+        answer_until_tick_.store(0, std::memory_order_release);
+        chime_due_tick_.store(0, std::memory_order_release);
         led_red_.store(false, std::memory_order_release);
     }
 
@@ -691,17 +934,25 @@ private:
         return until != 0 && static_cast<int32_t>(until - xTaskGetTickCount()) > 0;
     }
 
+    // One device-initiated question buys one audible answer. Armed the moment the prompt goes out, so
+    // the gate never has to guess whether the answer or the verdict will arrive first — see the header.
+    void ArmAnswerWindow() {
+        answer_until_tick_.store(xTaskGetTickCount() + pdMS_TO_TICKS(STUDY_ANSWER_WINDOW_MS),
+                                 std::memory_order_release);
+    }
+
     // True when TTS may reach the DAC. Lock-free — called from the transport task on every chunk.
     //
     // What this suppresses is UNSOLICITED audio during a study phase: the Agent receives a photo every
     // minute, and if it comments on each one the speaker talks over the very focus this is protecting.
-    // What it must NOT suppress is a reply the user actually asked for. Two windows open the gate:
-    //   - alert window: armed by a "distracted" verdict, for STUDY_ALERT_PHRASE.
-    //   - reply window: armed when the user releases PTT, so their own question gets an audible answer.
+    // What it must NOT suppress is an answer to something that was actually asked. Two windows open it:
+    //   - answer window: armed when the DEVICE asks (photo analysis, phase announcement); closed by an
+    //     `attentive` verdict, extended by a `distracted` one.
+    //   - reply window:  armed when the user releases PTT, so their own question gets an audible answer.
     // Outside a study phase nothing is gated at all.
     bool SpeakerAllowed() const {
         if (!monitoring_active_.load(std::memory_order_acquire)) return true;   // not studying: normal audio
-        return WindowOpen(alert_until_tick_.load(std::memory_order_acquire)) ||
+        return WindowOpen(answer_until_tick_.load(std::memory_order_acquire)) ||
                WindowOpen(reply_until_tick_.load(std::memory_order_acquire));
     }
 
@@ -724,7 +975,8 @@ private:
         auto_tick_ = xTaskGetTickCount();  // first photo one interval in, not immediately
         monitoring_active_.store(true, std::memory_order_release);
         (void)led_.SetColor(0, 32, 0);     // green = studying
-        ReportStatus("study_started", "开始专注学习");
+        ChimeStudyStart();                 // a pomodoro begins
+        ReportStatus("study_started", "已进入专注学习阶段");
     }
 
     void StartBreakPhase(bool is_long) {
@@ -740,9 +992,10 @@ private:
         monitoring_active_.store(false, std::memory_order_release);   // no photos on a break
         CameraPowerDown();                                            // and the sensor is off, not just idle
         (void)led_.SetColor(32, 16, 0);                               // orange = break
+        ChimeStudyEnd();                                              // a pomodoro just ended
         ESP_LOGI(TAG, "%s BREAK started (%u mins)", is_long ? "LONG" : "SHORT", (unsigned)mins);
         char note[64];
-        snprintf(note, sizeof(note), "开始%s休息%u分钟", is_long ? "长" : "短", (unsigned)mins);
+        snprintf(note, sizeof(note), "已进入%s休息，共%u分钟", is_long ? "长" : "短", (unsigned)mins);
         ReportStatus(is_long ? "long_break_started" : "short_break_started", note);
     }
 
@@ -778,8 +1031,9 @@ private:
         if (study) { (void)CameraPowerUp(); auto_tick_ = xTaskGetTickCount(); }
         monitoring_active_.store(study, std::memory_order_release);
         (void)led_.SetColor(study ? 0 : 32, study ? 32 : 16, 0);
+        if (study) ChimeStudyStart();      // resuming into a study phase is a pomodoro starting
         ESP_LOGI(TAG, "Session RESUMED (%s)", study ? "studying" : "break");
-        ReportStatus("resumed", study ? "继续学习" : "继续休息");
+        ReportStatus("resumed", study ? "已恢复到学习阶段" : "已恢复到休息阶段");
     }
 
     // done=true when the plan ran to completion; false when the user/Agent ended it early.
@@ -787,6 +1041,7 @@ private:
         uint8_t made, want;
         {
             std::lock_guard<std::mutex> lk(pomo_mtx_);
+            if (pomo_.phase == POMODORO_IDLE) return;   // already stopped: nothing happened, announce nothing
             pomo_.phase = POMODORO_IDLE;
             made = pomo_.completed_cycles;
             want = pomo_.total_cycles;
@@ -795,6 +1050,9 @@ private:
         CameraPowerDown();                         // session over: sensor off until the next one
         ClearAlert();
         (void)led_.SetColor(0, 0, 0);
+        // The final pomodoro ends here, not in StartBreakPhase, so it needs its own chime. An early
+        // stop is the user's own doing and gets none — they already know.
+        if (done) ChimeSessionDone();
         ESP_LOGI(TAG, "Session %s (%u/%u cycles)", done ? "COMPLETE" : "STOPPED", (unsigned)made, (unsigned)want);
         char note[80];
         if (done) snprintf(note, sizeof(note), "全部%u个番茄钟已完成，学习结束", (unsigned)want);
@@ -815,14 +1073,34 @@ private:
             phase_name = PhaseToString(pomo_.phase);
         }
 
+        // Belt and braces behind the guards above: if the exact same transition is reported twice in a
+        // row, the second one carries no information and must not reach the Agent — an identical prompt
+        // is what a restart loop looks like from the far end.
+        if (strcmp(status, last_status_) == 0 && made == last_made_ && want == last_want_) {
+            ESP_LOGW(TAG, "status '%s' unchanged since the last report — not announced again", status);
+            return;
+        }
+        snprintf(last_status_, sizeof(last_status_), "%s", status);
+        last_made_ = made;
+        last_want_ = want;
+
         char buf[160];
         int n = snprintf(buf, sizeof(buf), "%s|phase=%s|cycle=%u/%u", status, phase_name, (unsigned)made, (unsigned)want);
         if (n > 0) (void)agent_link_push_reading("study_status", buf, (size_t)n);
 
-        n = snprintf(buf, sizeof(buf), "[学习计时器] %s（进度 %u/%u 个番茄钟）", note, (unsigned)made, (unsigned)want);
+        // Declarative, and labelled as a device notification. This text reaches the model through the
+        // same channel as the user's own speech, so an imperative here is indistinguishable from an
+        // order — which is exactly how the restart loop got started. Phrase it as something that has
+        // already happened; the "do not act on this" rule lives in study_session's manifest desc, which
+        // has room for it and does not eat into the single-notify budget every announcement pays.
+        n = snprintf(buf, sizeof(buf), "[设备状态播报] %s（进度 %u/%u 个番茄钟）", note, (unsigned)made, (unsigned)want);
         if (n > 0) {
             const esp_err_t r = agent_link_push_prompt(buf);
-            if (r != ESP_OK) ESP_LOGW(TAG, "status prompt not sent: %s", esp_err_to_name(r));
+            // Same rule as the analysis prompt: the device asked, so one answer may be spoken. Without
+            // this, the Agent's reply to "开始专注学习" landed after monitoring_active_ had already gone
+            // true and was muted — the user heard nothing at the one moment they were being addressed.
+            if (r == ESP_OK) ArmAnswerWindow();
+            else             ESP_LOGW(TAG, "status prompt not sent: %s", esp_err_to_name(r));
         }
     }
 
@@ -876,13 +1154,37 @@ private:
     void ShowIdleScreen() {
         if (!cat_.Ready()) return;
         (void)lcd_.DrawBitmap(0, 0, cat_.Width(), cat_.Height(), cat_.Pixels());
+        DrawWhiskerBand(0);   // the framebuffer above has no whiskers in it; they live in the band
+    }
+
+    // ~40 rows instead of 240. DrawBitmap flushes before returning, so consecutive calls are safe and
+    // the band's source buffer can be rebuilt immediately.
+    void DrawWhiskerBand(int wag_px) {
+        if (!cat_.Animated()) return;   // band alloc failed at boot: whiskers are baked in at rest
+        const void* px = cat_.RenderBand(wag_px);
+        if (px) (void)lcd_.DrawBitmap(0, cat_.BandTop(), cat_.Width(), cat_.BandHeight(), px);
+    }
+
+    // Wag only while a study phase is actually running. Breaks, pause and idle all leave the cat dead
+    // still, so "nothing is moving" is a truthful signal that nothing is being watched.
+    void ServiceWhiskers(bool studying) {
+        if (!cat_.Animated()) return;
+        if (!studying) {
+            // Settle back to rest exactly once, or an interrupted wag leaves the whiskers frozen
+            // mid-swing — which looks like a crashed screen rather than a stopped session.
+            if (wag_step_ != 0) { wag_step_ = 0; DrawWhiskerBand(0); }
+            return;
+        }
+        wag_step_ = static_cast<uint8_t>((wag_step_ + 1) % kWagSteps);
+        DrawWhiskerBand(kWagCycle[wag_step_] * CAT_WHISKER_WAG_PX / 127);
     }
 
     static void CaptureTaskEntry(void* arg) { static_cast<Gc2145CameraBoard*>(arg)->CaptureLoop(); }
 
     // Idles at 100ms. It only ever calls esp_camera_fb_get when a snapshot was actually requested AND the
-    // sensor is powered, so with the camera off this loop does nothing but tick. The screen is not touched
-    // here at all — the cat is static, so it is drawn on transitions, not per frame.
+    // sensor is powered, so with the camera off this loop does nothing but tick. It is also the only task
+    // that touches the screen after boot: it advances the whisker wag one step per tick, so the LCD keeps
+    // a single writer and the animation costs one ~40-row blit rather than a full frame.
     void CaptureLoop() {
         ESP_LOGI(TAG, "capture task started (camera powered only during study phases)");
 #if CAMERA_AUTO_CAPTURE_INTERVAL_MS > 0
@@ -893,6 +1195,17 @@ private:
             vTaskDelay(pdMS_TO_TICKS(100));
 
             const bool studying = monitoring_active_.load(std::memory_order_acquire);
+            ServiceWhiskers(studying);
+
+            // Fallback chime, if the alert voice never arrived. Serviced here rather than in OnVerdict
+            // because that runs on the NimBLE host task and Tone() waits on the play buffer.
+            const TickType_t due = chime_due_tick_.load(std::memory_order_acquire);
+            if (due != 0 && static_cast<int32_t>(xTaskGetTickCount() - due) >= 0) {
+                chime_due_tick_.store(0, std::memory_order_release);
+                ESP_LOGW(TAG, "no alert voice from the cloud within %ums — speaking the local clip instead",
+                         (unsigned)STUDY_ALERT_FALLBACK_MS);
+                PlayAlertVoice();
+            }
 
 #if CAMERA_AUTO_CAPTURE_INTERVAL_MS > 0
             // Timed snapshot. Only while studying, the link is up, and the sensor has finished settling —
@@ -966,6 +1279,7 @@ private:
     // Study monitoring control: camera is active ONLY during POMODORO_STUDYING phases
     std::atomic<bool>    monitoring_active_{false};
     TickType_t           auto_tick_ = 0;           // phase of the timed-snapshot clock (preview task only)
+    uint8_t              wag_step_  = 0;           // index into kWagCycle; capture task only
     // Pomodoro session state. Guarded by pomo_mtx_: written by the SDK callback thread (study_session /
     // study_control) and by the pomodoro task (phase advance).
     PomodoroSession      pomo_;
@@ -974,9 +1288,18 @@ private:
     // pomo_mtx_); pending_cmd_ is the atomic doorbell the loop drains each tick.
     std::atomic<uint8_t> pending_cmd_{kPendNone};
     char                 pending_json_[257] = {};
-    // Speaker gate: 0 = muted while studying; otherwise the tick the alert window closes at. Set by the
-    // verdict callback (host task), read by PlayAudio (transport task) — atomic, never locked.
-    std::atomic<TickType_t> alert_until_tick_{0};
+    // Last announced transition, for the dedup in ReportStatus (pomodoro task only).
+    char                 last_status_[32] = {};
+    uint8_t              last_made_ = 0xFF;
+    uint8_t              last_want_ = 0xFF;
+    // Speaker gate: 0 = muted while studying; otherwise the tick the answer window closes at. Armed
+    // whenever the device sends a prompt, closed by an `attentive` verdict or once an answer has
+    // played. Written from the pomodoro/capture tasks and the host task, read by PlayAudio on the
+    // transport task — atomic, never locked.
+    std::atomic<TickType_t> answer_until_tick_{0};
+    // Fallback-chime deadline (0 = nothing pending). Armed by a distracted verdict on the host task,
+    // disarmed by PlayAudio the moment real TTS gets through, fired by the capture task if it expires.
+    std::atomic<TickType_t> chime_due_tick_{0};
     // Armed on PTT release: the user asked something, so the Agent's answer must be audible even during
     // a study phase. Without this the gate silently swallowed every reply the user asked for.
     std::atomic<TickType_t> reply_until_tick_{0};

@@ -36,16 +36,22 @@ elseif(NOT CMAKE_BUILD_EARLY_EXPANSION)
 endif()
 
 set(EXTRA_REQUIRES "")
+set(EXTRA_EMBEDS "")
 if(CONFIG_BOARD_TYPE_ESP32P4_WAVESHARE)
     list(APPEND EXTRA_REQUIRES esp_lcd_co5300)
 endif()
 if(CONFIG_BOARD_TYPE_ESP32S3_GC2145_CAMERA)
     list(APPEND EXTRA_REQUIRES esp32_camera esp_driver_rmt)
+    # The spoken "请认真学习" alert, raw PCM16/16k/mono. Embedded rather than generated into a C array so
+    # the clip stays a real audio file that can be replaced with `say`/ffmpeg without touching any source.
+    # Symbols come from the basename: _binary_alert_voice_pcm_start / _end.
+    list(APPEND EXTRA_EMBEDS "${CMAKE_CURRENT_SOURCE_DIR}/../boards/gc2145-camera/alert_voice.pcm")
 endif()
 
 idf_component_register(
     SRCS ${SOURCES}
     INCLUDE_DIRS ${INCLUDE_DIRS}
+    EMBED_FILES ${EXTRA_EMBEDS}
     REQUIRES agent_link esp_driver_gpio esp_driver_spi esp_lcd esp_lcd_sh8501
              esp_codec_dev esp_driver_i2c esp_driver_i2s json ${EXTRA_REQUIRES})
 
